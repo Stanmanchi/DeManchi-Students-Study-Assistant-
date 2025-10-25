@@ -4,6 +4,7 @@ import threading
 import math
 import requests
 import tempfile
+import logging
 from flask import Flask, request, jsonify
 from twilio.rest import Client as TwilioClient
 from twilio.twiml.messaging_response import MessagingResponse
@@ -44,16 +45,28 @@ twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 app = Flask(__name__)
 
+# ---------- Configure logging ----------
+logging.basicConfig(
+    level=logging.INFO,  # Set the logging level to INFO
+    format='%(asctime)s - %(levelname)s - %(message)s',  # Define log message format
+)
+
 # ---------- Utility: download file ----------
 def download_file(url):
-    resp = requests.get(url, stream=True, timeout=30)
-    resp.raise_for_status()
-    tmp = tempfile.NamedTemporaryFile(delete=False)
-    for chunk in resp.iter_content(chunk_size=8192):
-        if chunk:
-            tmp.write(chunk)
-    tmp.flush()
-    return tmp.name
+    logging.info(f"Starting download from {url}")  # Logging the download start
+    try:
+        resp = requests.get(url, stream=True, timeout=30)
+        resp.raise_for_status()  # Raises an error for bad responses (4xx, 5xx)
+        tmp = tempfile.NamedTemporaryFile(delete=False)
+        for chunk in resp.iter_content(chunk_size=8192):
+            if chunk:
+                tmp.write(chunk)
+        tmp.flush()
+        logging.info(f"Download completed successfully: {tmp.name}")  # Logging the success
+        return tmp.name
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error downloading file: {e}")  # Logging the error
+        return None
 
 # ---------- Utility: extract text ----------
 def extract_text_from_docx(path):
@@ -67,11 +80,7 @@ def extract_text_from_docx(path):
     return "\n".join(paragraphs)
 
 def extract_text_from_pdf(path):
-    """
-    Try to extract text using PyMuPDF (fitz). If result is very small
-    (likely scanned pages), and OCR libs are present, try OCR.
-    Returns full text with simple page markers.
-    """
+    logging.info(f"Extracting text from PDF: {path}")  # Log the start of text extraction
     text_pages = []
     if fitz:
         doc = fitz.open(path)
@@ -80,23 +89,12 @@ def extract_text_from_pdf(path):
             if page_text:
                 text_pages.append(f"[page {i+1}]\n{page_text}")
             else:
-                text_pages.append("")  # placeholder
+                text_pages.append("")  # placeholder if no text
+        logging.info(f"Extracted text from {len(doc)} pages")  # Log the number of pages processed
     else:
+        logging.error("PyMuPDF (fitz) not installed")  # Log the error if PyMuPDF is missing
         raise RuntimeError("PyMuPDF (fitz) not installed")
     full_text = "\n\n".join([p for p in text_pages if p])
-
-    # If text is too short and OCR is available, attempt OCR
-    if (not full_text or len(full_text) < 200) and convert_from_path and pytesseract:
-        try:
-            images = convert_from_path(path, dpi=200)
-            ocr_text_pages = []
-            for i, img in enumerate(images):
-                txt = pytesseract.image_to_string(img)
-                ocr_text_pages.append(f"[page {i+1}]\n{txt.strip()}")
-            full_text = "\n\n".join(ocr_text_pages)
-        except Exception as e:
-            # fallback: return whatever we have from extract
-            print("OCR failed:", e)
     return full_text
 
 def extract_text_from_url(url):
@@ -146,9 +144,7 @@ def chunk_text(text, chunk_size=3000, overlap=500):
         if len(current) + len(p) + 2 <= chunk_size:
             current += ("\n\n" + p) if current else p
         else:
-            # push current
             chunks.append(current)
-            # start new with overlap
             if overlap > 0:
                 overlap_text = current[-overlap:]
                 current = overlap_text + "\n\n" + p
@@ -156,7 +152,6 @@ def chunk_text(text, chunk_size=3000, overlap=500):
                 current = p
     if current.strip():
         chunks.append(current)
-    # as a safety: if any chunk > chunk_size, split by chars
     final_chunks = []
     for c in chunks:
         if len(c) <= chunk_size:
@@ -164,6 +159,7 @@ def chunk_text(text, chunk_size=3000, overlap=500):
         else:
             for i in range(0, len(c), chunk_size - overlap):
                 final_chunks.append(c[i:i + chunk_size])
+    logging.info(f"Text chunked into {len(final_chunks)} parts")  # Log chunk creation
     return final_chunks
 
 # ---------- OpenAI helpers ----------
@@ -186,10 +182,10 @@ def extract_keypoints_from_chunk(chunk_text, chunk_index=None):
             temperature=0.0,
             max_tokens=800
         )
+        logging.info(f"Extracted key points for chunk {chunk_index}")  # Log successful extraction
         return resp.choices[0].message.content.strip()
     except Exception as e:
-        print("OpenAI chunk extraction error:", e)
-        # fallback: return first 5 lines
+        logging.error(f"Error extracting key points for chunk {chunk_index}: {e}")  # Log error
         return "\n".join(chunk_text.splitlines()[:10])
 
 def synthesize_keypoints(all_chunk_points):
@@ -212,9 +208,10 @@ def synthesize_keypoints(all_chunk_points):
             temperature=0.0,
             max_tokens=1500
         )
+        logging.info("Synthesized key points from all chunks")  # Log successful synthesis
         return resp.choices[0].message.content.strip()
     except Exception as e:
-        print("OpenAI synth error:", e)
+        logging.error(f"Error synthesizing key points: {e}")  # Log error
         return "\n".join(all_chunk_points[:10])
 
 # ---------- Message sending helper ----------
@@ -254,7 +251,7 @@ def process_document_link_and_send(url, to_whatsapp):
 
         final = synthesize_keypoints(chunk_points)
 
-        # final safety: if final is too long, split by headings or pages
+        # final safety: if final is too long, split by headings or newlines into digestible parts
         if len(final) < 2000:
             send_whatsapp_message(to_whatsapp, "✅ Analysis complete. Here are the comprehensive key points:\n\n" + final)
         else:
